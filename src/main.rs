@@ -3,6 +3,7 @@ use rand::distr::{Alphanumeric, SampleString};
 use rusqlite::OpenFlags;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Instant;
 use tracing_subscriber::prelude::*;
 
 #[derive(Debug, thiserror::Error)]
@@ -13,26 +14,26 @@ pub enum Error {
     Rusqlite(#[from] rusqlite::Error),
 }
 
-// pub fn apply_default_pragmas(conn: &rusqlite::Connection) -> Result<(), rusqlite::Error> {
-//     conn.pragma_update(None, "busy_timeout", 10000)?;
-//     conn.pragma_update(None, "journal_mode", "WAL")?;
-//     conn.pragma_update(None, "journal_size_limit", 200000000)?;
-//     // Sync the file system less often.
-//     conn.pragma_update(None, "synchronous", "NORMAL")?;
-//     conn.pragma_update(None, "foreign_keys", "ON")?;
-//     conn.pragma_update(None, "temp_store", "MEMORY")?;
-//     // TODO: we could consider pushing this further down-stream to optimize
-//     // for different use-cases, e.g. main vs logs.
-//     conn.pragma_update(None, "cache_size", -16000)?;
-//     // Keep SQLite default 4KB page_size
-//     // conn.pragma_update(None, "page_size", 4096)?;
-//
-//     // Safety feature around application-defined functions recommended by
-//     // https://sqlite.org/appfunc.html
-//     conn.pragma_update(None, "trusted_schema", "OFF")?;
-//
-//     return Ok(());
-// }
+pub fn apply_default_pragmas(conn: &rusqlite::Connection) -> Result<(), rusqlite::Error> {
+    conn.pragma_update(None, "busy_timeout", 10000)?;
+    conn.pragma_update(None, "journal_mode", "WAL")?;
+    conn.pragma_update(None, "journal_size_limit", 200000000)?;
+    // Sync the file system less often.
+    conn.pragma_update(None, "synchronous", "NORMAL")?;
+    conn.pragma_update(None, "foreign_keys", "ON")?;
+    conn.pragma_update(None, "temp_store", "MEMORY")?;
+    // TODO: we could consider pushing this further down-stream to optimize
+    // for different use-cases, e.g. main vs logs.
+    conn.pragma_update(None, "cache_size", -16000)?;
+    // Keep SQLite default 4KB page_size
+    // conn.pragma_update(None, "page_size", 4096)?;
+
+    // Safety feature around application-defined functions recommended by
+    // https://sqlite.org/appfunc.html
+    conn.pragma_update(None, "trusted_schema", "OFF")?;
+
+    return Ok(());
+}
 
 fn graft_config() -> graft_kernel::setup::GraftConfig {
     let path = PathBuf::from("./graft");
@@ -86,7 +87,7 @@ pub fn connect(path: PathBuf) -> Result<rusqlite::Connection, Error> {
 
     let conn = rusqlite::Connection::open_with_flags(graft_tag.unwrap_or(path), flags)?;
 
-    // apply_default_pragmas(&conn)?;
+    apply_default_pragmas(&conn)?;
 
     return Ok(conn);
 }
@@ -94,31 +95,40 @@ pub fn connect(path: PathBuf) -> Result<rusqlite::Connection, Error> {
 #[tokio::main]
 async fn main() {
     tracing_subscriber::registry()
-        .with(tracing_subscriber::filter::LevelFilter::DEBUG)
+        .with(tracing_subscriber::filter::LevelFilter::INFO)
         .with(tracing_subscriber::fmt::layer())
         .init();
 
-    let tasks: Vec<_> = (0..1)
+    let start = Instant::now();
+
+    let tasks: Vec<_> = (0..64)
         .map(|_| {
             tokio::spawn(async {
-                // let tmp_dir = tempfile::TempDir::new().unwrap();
-                // let c =
-                //     connect(format!("file:{}?vfs=graft", tmp_dir.path().to_string_lossy()).into());
-                let tag = Alphanumeric.sample_string(&mut rand::rng(), 16);
-                let c = connect(format!("file:{tag}?vfs=graft").into()).unwrap();
+                let use_graft = true;
+                let c = if use_graft {
+                    let tag = Alphanumeric.sample_string(&mut rand::rng(), 16);
+                    connect(format!("file:{tag}?vfs=graft").into()).unwrap()
+                } else {
+                    let tmp_dir = tempfile::TempDir::new().unwrap();
+                    connect(
+                        format!("file:{}/main.db?vfs=unix", tmp_dir.path().to_string_lossy())
+                            .into(),
+                    )
+                    .unwrap()
+                };
 
-                c.execute("CREATE TABLE test (id INTEGER PRIMARY KEY", ())
+                c.execute("CREATE TABLE test (id INTEGER PRIMARY KEY) STRICT", ())
                     .unwrap();
 
-                // for i in 0..10 {
-                //     c.execute("INSERT INTO test (id) VALUES (?1)", (i,))
-                //         .unwrap();
-                // }
+                for i in 0..50000 {
+                    c.execute("INSERT INTO test (id) VALUES (?1)", (i,))
+                        .unwrap();
+                }
             })
         })
         .collect();
 
     futures::future::join_all(tasks).await;
 
-    println!("Done, done, done");
+    println!("Done, done, done: {:?}", Instant::now() - start);
 }
