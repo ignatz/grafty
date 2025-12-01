@@ -74,6 +74,7 @@ pub fn connect(mut path: PathBuf, use_graft: bool) -> Result<rusqlite::Connectio
 }
 
 #[derive(Debug)]
+#[allow(dead_code, reason = "debug impl used")]
 struct Stats {
     total: Duration,
     avg: Duration,
@@ -82,7 +83,7 @@ struct Stats {
 async fn bench_all(
     paths: &[PathBuf],
     use_graft: bool,
-    bench: fn(&Connection) -> Result<Duration, Error>,
+    bench: fn(&mut Connection) -> Result<Duration, Error>,
 ) -> Result<Stats, Error> {
     let start = Instant::now();
     let mut futures = FuturesUnordered::new();
@@ -90,8 +91,8 @@ async fn bench_all(
     for path in paths {
         let path = path.clone();
         futures.push(spawn_blocking(move || {
-            let conn = connect(path, use_graft)?;
-            bench(&conn)
+            let mut conn = connect(path, use_graft)?;
+            bench(&mut conn)
         }));
     }
 
@@ -107,22 +108,46 @@ async fn bench_all(
     })
 }
 
-fn write_bench_single(conn: &Connection) -> Result<Duration, Error> {
+fn write_bench_single(conn: &mut Connection) -> Result<Duration, Error> {
     let start = Instant::now();
     conn.execute("CREATE TABLE test (id INTEGER PRIMARY KEY) STRICT", ())?;
-
     for i in 0..20000 {
         conn.execute("INSERT INTO test (id) VALUES (?1)", (i,))?;
     }
     Ok(Instant::now() - start)
 }
 
-/// only works if `write_bench` was previously run on the same connection
-fn read_bench_single(conn: &Connection) -> Result<Duration, Error> {
+fn write_bench_tx(conn: &mut Connection) -> Result<Duration, Error> {
+    let start = Instant::now();
+    let tx = conn.transaction()?;
+    tx.execute("CREATE TABLE test2 (id INTEGER PRIMARY KEY) STRICT", ())?;
+    for i in 0..20000 {
+        tx.execute("INSERT INTO test2 (id) VALUES (?1)", (i,))?;
+    }
+    tx.commit()?;
+    Ok(Instant::now() - start)
+}
+
+/// only works if `write_bench_single` was previously run on the same connection
+fn read_bench_single(conn: &mut Connection) -> Result<Duration, Error> {
     let start = Instant::now();
     for _ in 0..2 {
         for i in 0..20000 {
             conn.query_row("SELECT id FROM test WHERE id = ?1", (i,), |row| {
+                row.get::<_, i64>(0)
+            })?;
+        }
+    }
+    Ok(Instant::now() - start)
+}
+
+/// only works if `write_bench_tx` was previously run on the same connection
+fn read_bench_tx(conn: &mut Connection) -> Result<Duration, Error> {
+    let start = Instant::now();
+    let tx = conn.transaction()?;
+    for _ in 0..2 {
+        for i in 0..20000 {
+            tx.query_row("SELECT id FROM test2 WHERE id = ?1", (i,), |row| {
                 row.get::<_, i64>(0)
             })?;
         }
@@ -145,8 +170,10 @@ async fn main() {
     }
     std::fs::create_dir(&test_dir).unwrap();
 
-    // create 64 separate unique path names in the test directory
-    let paths = (0..64)
+    const CONCURRENCY: usize = 8;
+
+    // create unique path names for each concurrent db in the test directory
+    let paths = (0..CONCURRENCY)
         .map(|i| test_dir.join(format!("db{i}.db")))
         .collect::<Vec<_>>();
 
@@ -158,15 +185,34 @@ async fn main() {
     };
     graft_sqlite::register_static("graft", false, config).unwrap();
 
-    let stats = bench_all(&paths, false, write_bench_single).await.unwrap();
-    println!("write_bench_single, plain sqlite: {stats:?}");
+    struct Test {
+        name: &'static str,
+        bench: fn(&mut Connection) -> Result<Duration, Error>,
+    }
 
-    let stats = bench_all(&paths, true, write_bench_single).await.unwrap();
-    println!("write_bench_single, graft sqlite: {stats:?}");
+    let tests = [
+        Test {
+            name: "write_bench_single",
+            bench: write_bench_single,
+        },
+        Test {
+            name: "read_bench_single",
+            bench: read_bench_single,
+        },
+        Test {
+            name: "write_bench_tx",
+            bench: write_bench_tx,
+        },
+        Test {
+            name: "read_bench_tx",
+            bench: read_bench_tx,
+        },
+    ];
 
-    let stats = bench_all(&paths, false, read_bench_single).await.unwrap();
-    println!("read_bench_single, plain sqlite: {stats:?}");
-
-    let stats = bench_all(&paths, true, read_bench_single).await.unwrap();
-    println!("read_bench_single, graft sqlite: {stats:?}");
+    for Test { name, bench } in tests {
+        let stats = bench_all(&paths, false, bench).await.unwrap();
+        println!("{name}, plain sqlite: {stats:?}");
+        let stats = bench_all(&paths, true, bench).await.unwrap();
+        println!("{name}, graft sqlite: {stats:?}");
+    }
 }
