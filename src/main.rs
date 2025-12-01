@@ -1,17 +1,21 @@
-use base64::prelude::*;
-use rand::distr::{Alphanumeric, SampleString};
-use rusqlite::OpenFlags;
+use futures::TryStreamExt;
+use futures::stream::FuturesUnordered;
+use graft_kernel::remote::RemoteConfig;
+use graft_kernel::setup::GraftConfig;
+use rusqlite::{Connection, OpenFlags};
 use std::path::PathBuf;
-use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
+use tokio::task::{JoinError, spawn_blocking};
 use tracing_subscriber::prelude::*;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("GraftInit: {0}")]
-    GraftInit(#[from] Arc<graft_kernel::setup::InitErr>),
+    GraftInit(#[from] graft_kernel::setup::InitErr),
     #[error("Rusqlite: {0}")]
     Rusqlite(#[from] rusqlite::Error),
+    #[error("Thread panic: {0}")]
+    JoinErr(#[from] JoinError),
 }
 
 pub fn apply_default_pragmas(conn: &rusqlite::Connection) -> Result<(), rusqlite::Error> {
@@ -35,66 +39,95 @@ pub fn apply_default_pragmas(conn: &rusqlite::Connection) -> Result<(), rusqlite
     return Ok(());
 }
 
-fn graft_config() -> graft_kernel::setup::GraftConfig {
-    let path = PathBuf::from("./graft");
-    let data_dir = path.join("local");
-    if !data_dir.exists() {
-        if let Err(err) = std::fs::create_dir_all(&data_dir) {
-            log::error!("Failed to create {data_dir:?}: {err}");
-        }
-    }
+pub fn apply_graft_pragmas(conn: &rusqlite::Connection) -> Result<(), rusqlite::Error> {
+    // graft recommends only setting journal_mode=MEMORY
+    // see: https://graft.rs/docs/sqlite/compatibility/
+    conn.pragma_update(None, "journal_mode", "MEMORY")?;
 
-    return graft_kernel::setup::GraftConfig {
-        data_dir,
-        // Neglect remote for now. We're just experimenting.
-        remote: graft_kernel::remote::RemoteConfig::Memory,
-        autosync: None,
-    };
+    conn.pragma_update(None, "busy_timeout", 10000)?;
+    conn.pragma_update(None, "temp_store", "MEMORY")?;
+    conn.pragma_update(None, "trusted_schema", "OFF")?;
+    conn.pragma_update(None, "cache_size", -16000)?;
+
+    return Ok(());
 }
 
-pub fn connect(path: PathBuf) -> Result<rusqlite::Connection, Error> {
-    let mut graft_tag: Option<PathBuf> = None;
-
-    // Expected something like "file:///tmp/dir?vfs=graft".
-    if let Ok(url) = url::Url::parse(&path.to_string_lossy()) {
-        if url.query_pairs().any(|(k, v)| {
-            return k == "vfs" && v == "graft";
-        }) {
-            use std::sync::OnceLock;
-
-            static ONCE: OnceLock<Result<(), Arc<graft_kernel::setup::InitErr>>> = OnceLock::new();
-            ONCE.get_or_init(|| {
-                graft_sqlite::register_static("graft", false, graft_config()).map_err(|err| {
-                    let (e, _trace) = err.into();
-                    return e.into();
-                })
-            })
-            .as_ref()
-            .map_err(|err| err.clone())?;
-
-            // NOTE: this is a hack, just wasn't sure if there's any limits on what's a valid
-            // tag :shrug:
-            let tag = BASE64_STANDARD.encode(url.path());
-            graft_tag = Some(PathBuf::from(format!("file:{tag}?vfs=graft")));
-            log::info!("Using graft tag: {graft_tag:?}");
-        }
+pub fn connect(mut path: PathBuf, use_graft: bool) -> Result<rusqlite::Connection, Error> {
+    if use_graft {
+        path = PathBuf::from(format!("file:{}?vfs=graft", path.to_string_lossy()));
     }
 
     let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
         | OpenFlags::SQLITE_OPEN_CREATE
-        | OpenFlags::SQLITE_OPEN_NO_MUTEX
+        // | OpenFlags::SQLITE_OPEN_NO_MUTEX
         | OpenFlags::SQLITE_OPEN_URI;
 
-    let conn = rusqlite::Connection::open_with_flags(graft_tag.unwrap_or(path), flags)?;
+    let conn = rusqlite::Connection::open_with_flags(path, flags)?;
 
-    apply_default_pragmas(&conn)?;
+    if use_graft {
+        apply_graft_pragmas(&conn)?;
+    } else {
+        apply_default_pragmas(&conn)?;
+    }
 
     return Ok(conn);
 }
 
-struct Path {
-    path: PathBuf,
-    tempdir: Option<tempfile::TempDir>,
+#[derive(Debug)]
+struct Stats {
+    total: Duration,
+    avg: Duration,
+}
+
+async fn bench_all(
+    paths: &[PathBuf],
+    use_graft: bool,
+    bench: fn(&Connection) -> Result<Duration, Error>,
+) -> Result<Stats, Error> {
+    let start = Instant::now();
+    let mut futures = FuturesUnordered::new();
+
+    for path in paths {
+        let path = path.clone();
+        futures.push(spawn_blocking(move || {
+            let conn = connect(path, use_graft)?;
+            bench(&conn)
+        }));
+    }
+
+    let mut sum = Duration::ZERO;
+    // wait for all futures to complete
+    while let Some(result) = futures.try_next().await? {
+        sum += result?;
+    }
+
+    Ok(Stats {
+        total: Instant::now() - start,
+        avg: sum / paths.len() as u32,
+    })
+}
+
+fn write_bench_single(conn: &Connection) -> Result<Duration, Error> {
+    let start = Instant::now();
+    conn.execute("CREATE TABLE test (id INTEGER PRIMARY KEY) STRICT", ())?;
+
+    for i in 0..20000 {
+        conn.execute("INSERT INTO test (id) VALUES (?1)", (i,))?;
+    }
+    Ok(Instant::now() - start)
+}
+
+/// only works if `write_bench` was previously run on the same connection
+fn read_bench_single(conn: &Connection) -> Result<Duration, Error> {
+    let start = Instant::now();
+    for _ in 0..2 {
+        for i in 0..20000 {
+            conn.query_row("SELECT id FROM test WHERE id = ?1", (i,), |row| {
+                row.get::<_, i64>(0)
+            })?;
+        }
+    }
+    Ok(Instant::now() - start)
 }
 
 #[tokio::main]
@@ -104,75 +137,36 @@ async fn main() {
         .with(tracing_subscriber::fmt::layer())
         .init();
 
-    let use_graft = true;
-    let paths: Vec<Path> = (0..64)
-        .map(|_| {
-            if use_graft {
-                let tag = Alphanumeric.sample_string(&mut rand::rng(), 16);
-                Path {
-                    path: PathBuf::from(format!("file:{tag}?vfs=graft")),
-                    tempdir: None,
-                }
-            } else {
-                let tmp_dir = tempfile::TempDir::new().unwrap();
-                Path {
-                    path: PathBuf::from(format!(
-                        "file:{}/main.db?vfs=unix",
-                        tmp_dir.path().to_string_lossy()
-                    )),
-                    tempdir: Some(tmp_dir),
-                }
-            }
-        })
-        .collect();
+    let test_dir = PathBuf::from("./data");
 
-    {
-        let start = Instant::now();
-        let tasks: Vec<_> = paths
-            .iter()
-            .map(|p| {
-                let path = p.path.clone();
-                tokio::spawn(async {
-                    let c = connect(path).unwrap();
-
-                    c.execute("CREATE TABLE test (id INTEGER PRIMARY KEY) STRICT", ())
-                        .unwrap();
-
-                    for i in 0..20000 {
-                        c.execute("INSERT INTO test (id) VALUES (?1)", (i,))
-                            .unwrap();
-                    }
-                })
-            })
-            .collect();
-
-        futures::future::join_all(tasks).await;
-        println!("Written: {:?}", Instant::now() - start);
+    // reset the test dir before starting test
+    if std::fs::exists(&test_dir).unwrap() {
+        std::fs::remove_dir_all(&test_dir).unwrap();
     }
+    std::fs::create_dir(&test_dir).unwrap();
 
-    {
-        let start = Instant::now();
-        let tasks: Vec<_> = paths
-            .iter()
-            .map(|p| {
-                let path = p.path.clone();
-                tokio::spawn(async {
-                    let c = connect(path).unwrap();
+    // create 64 separate unique path names in the test directory
+    let paths = (0..64)
+        .map(|i| test_dir.join(format!("db{i}.db")))
+        .collect::<Vec<_>>();
 
-                    for _ in 0..2 {
-                        for i in 0..20000 {
-                            c.query_row("SELECT id FROM test WHERE id = ?1", (i,), |row| {
-                                row.get::<_, i64>(0)
-                            })
-                            .unwrap();
-                        }
-                    }
-                })
-            })
-            .collect();
+    // register graft
+    let config = GraftConfig {
+        data_dir: test_dir.join("graft"),
+        remote: RemoteConfig::Memory,
+        autosync: None,
+    };
+    graft_sqlite::register_static("graft", false, config).unwrap();
 
-        futures::future::join_all(tasks).await;
+    let stats = bench_all(&paths, false, write_bench_single).await.unwrap();
+    println!("write_bench_single, plain sqlite: {stats:?}");
 
-        println!("Reads: {:?}", Instant::now() - start);
-    }
+    let stats = bench_all(&paths, true, write_bench_single).await.unwrap();
+    println!("write_bench_single, graft sqlite: {stats:?}");
+
+    let stats = bench_all(&paths, false, read_bench_single).await.unwrap();
+    println!("read_bench_single, plain sqlite: {stats:?}");
+
+    let stats = bench_all(&paths, true, read_bench_single).await.unwrap();
+    println!("read_bench_single, graft sqlite: {stats:?}");
 }
