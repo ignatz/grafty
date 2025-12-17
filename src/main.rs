@@ -1,7 +1,7 @@
 use futures::TryStreamExt;
 use futures::stream::FuturesUnordered;
-use graft_kernel::remote::RemoteConfig;
-use graft_kernel::setup::GraftConfig;
+use graft::remote::RemoteConfig;
+use graft::setup::GraftConfig;
 use rusqlite::{Connection, OpenFlags};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -11,7 +11,7 @@ use tracing_subscriber::prelude::*;
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("GraftInit: {0}")]
-    GraftInit(#[from] graft_kernel::setup::InitErr),
+    GraftInit(#[from] graft::setup::InitErr),
     #[error("Rusqlite: {0}")]
     Rusqlite(#[from] rusqlite::Error),
     #[error("Thread panic: {0}")]
