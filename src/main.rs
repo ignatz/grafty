@@ -52,7 +52,11 @@ pub fn apply_graft_pragmas(conn: &rusqlite::Connection) -> Result<(), rusqlite::
     return Ok(());
 }
 
-pub fn connect(mut path: PathBuf, use_graft: bool) -> Result<rusqlite::Connection, Error> {
+pub fn connect(
+    mut path: PathBuf,
+    use_graft: bool,
+    exclusive_lock: bool,
+) -> Result<rusqlite::Connection, Error> {
     if use_graft {
         path = PathBuf::from(format!("file:{}?vfs=graft", path.to_string_lossy()));
     }
@@ -70,6 +74,10 @@ pub fn connect(mut path: PathBuf, use_graft: bool) -> Result<rusqlite::Connectio
         apply_default_pragmas(&conn)?;
     }
 
+    if exclusive_lock {
+        conn.pragma_update(None, "locking_mode", "exclusive")?;
+    }
+
     return Ok(conn);
 }
 
@@ -83,6 +91,7 @@ struct Stats {
 async fn bench_all(
     paths: &[PathBuf],
     use_graft: bool,
+    exclusive_lock: bool,
     bench: fn(&mut Connection) -> Result<Duration, Error>,
 ) -> Result<Stats, Error> {
     let start = Instant::now();
@@ -91,7 +100,7 @@ async fn bench_all(
     for path in paths {
         let path = path.clone();
         futures.push(spawn_blocking(move || {
-            let mut conn = connect(path, use_graft)?;
+            let mut conn = connect(path, use_graft, exclusive_lock)?;
             bench(&mut conn)
         }));
     }
@@ -109,6 +118,7 @@ async fn bench_all(
 }
 
 fn write_bench_single(conn: &mut Connection) -> Result<Duration, Error> {
+    conn.execute("DROP TABLE IF EXISTS test", ())?;
     let start = Instant::now();
     conn.execute("CREATE TABLE test (id INTEGER PRIMARY KEY) STRICT", ())?;
     for i in 0..20000 {
@@ -118,11 +128,12 @@ fn write_bench_single(conn: &mut Connection) -> Result<Duration, Error> {
 }
 
 fn write_bench_tx(conn: &mut Connection) -> Result<Duration, Error> {
+    conn.execute("DROP TABLE IF EXISTS test", ())?;
     let start = Instant::now();
     let tx = conn.transaction()?;
-    tx.execute("CREATE TABLE test2 (id INTEGER PRIMARY KEY) STRICT", ())?;
+    tx.execute("CREATE TABLE test (id INTEGER PRIMARY KEY) STRICT", ())?;
     for i in 0..20000 {
-        tx.execute("INSERT INTO test2 (id) VALUES (?1)", (i,))?;
+        tx.execute("INSERT INTO test (id) VALUES (?1)", (i,))?;
     }
     tx.commit()?;
     Ok(Instant::now() - start)
@@ -141,13 +152,14 @@ fn read_bench_single(conn: &mut Connection) -> Result<Duration, Error> {
     Ok(Instant::now() - start)
 }
 
-/// only works if `write_bench_tx` was previously run on the same connection
+/// only works if `write_bench` or `write_bench_tx` was previously run on the
+/// same connection
 fn read_bench_tx(conn: &mut Connection) -> Result<Duration, Error> {
     let start = Instant::now();
     let tx = conn.transaction()?;
     for _ in 0..2 {
         for i in 0..20000 {
-            tx.query_row("SELECT id FROM test2 WHERE id = ?1", (i,), |row| {
+            tx.query_row("SELECT id FROM test WHERE id = ?1", (i,), |row| {
                 row.get::<_, i64>(0)
             })?;
         }
@@ -210,9 +222,13 @@ async fn main() {
     ];
 
     for Test { name, bench } in tests {
-        let stats = bench_all(&paths, false, bench).await.unwrap();
+        let stats = bench_all(&paths, false, false, bench).await.unwrap();
         println!("{name}, plain sqlite: {stats:?}");
-        let stats = bench_all(&paths, true, bench).await.unwrap();
+        let stats = bench_all(&paths, false, true, bench).await.unwrap();
+        println!("{name}, plain exclusive sqlite: {stats:?}");
+        let stats = bench_all(&paths, true, false, bench).await.unwrap();
         println!("{name}, graft sqlite: {stats:?}");
+        let stats = bench_all(&paths, true, true, bench).await.unwrap();
+        println!("{name}, graft exclusive sqlite: {stats:?}");
     }
 }
