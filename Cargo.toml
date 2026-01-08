@@ -6,8 +6,8 @@ edition = "2024"
 [dependencies]
 base64 = "0.22.1"
 futures = "0.3.31"
-graft = { git = "https://github.com/orbitinghail/graft.git" }
-graft-sqlite = { git = "https://github.com/orbitinghail/graft.git", features = ["register-static"] }
+graft = "0.2.1"
+graft-sqlite = { version = "0.2.1", features = ["register-static"] }
 log = "0.4.28"
 rand = "0.9.2"
 rusqlite = { version = "0.37.0", default-features = false, features = ["bundled", "column_decltype", "functions", "preupdate_hook"] }
